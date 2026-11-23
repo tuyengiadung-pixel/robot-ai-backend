@@ -39,7 +39,7 @@
         <span id="clock">08:30</span>
         <span id="status-badge">Sẵn sàng • Lái xe: 0 phút</span>
       </div>
-      <div class="reply-box" id="reply">Xin chào Phong! Bấm chọn 1 tính năng bên dưới hoặc chạm ô nhập chữ (dùng Micro trên bàn phím iPhone để nghe loa ngoài to rõ nhất).</div>
+      <div class="reply-box" id="reply">Xin chào Phong! Bấm nút Micro màu xanh bên dưới để nói (bấm lần 2 để gửi ngay), hoặc chọn nhanh tính năng.</div>
       <div class="audio-bar">
         <button class="stop-btn" onclick="stopAudio()">🔇 Dừng đọc</button>
       </div>
@@ -61,10 +61,10 @@
     </div>
 
     <div class="input-row">
-      <input id="prompt-input" type="text" placeholder="Nhập hoặc bấm Micro bàn phím..." onkeydown="if(event.key==='Enter') sendPrompt()" />
+      <input id="prompt-input" type="text" placeholder="Nhập hoặc bấm Micro bên dưới..." onkeydown="if(event.key==='Enter') sendPrompt()" />
       <button class="send-btn" onclick="sendPrompt()">Gửi</button>
     </div>
-    <button class="mic-btn" id="mic-btn" onclick="toggleMic()">🎙️ Nhấn để nói (Web Speech)</button>
+    <button class="mic-btn" id="mic-btn" onclick="toggleMic()">🎙️ Nhấn để nói (Whisper AI)</button>
     <audio id="tts-player" playsinline style="display:none;"></audio>
   </div>
 
@@ -72,7 +72,10 @@
     let currentMode = 'car';
     let drivingMinutes = 0;
     let audioQueue = [];
-    let isPlaying = false;
+    let mediaRecorder = null;
+    let mediaStream = null;
+    let audioChunks = [];
+    let autoStopTimer = null;
     const player = document.getElementById('tts-player');
 
     setInterval(() => {
@@ -93,7 +96,6 @@
 
     function stopAudio() {
       audioQueue = [];
-      isPlaying = false;
       player.pause();
       player.src = '';
     }
@@ -128,14 +130,10 @@
     }
 
     function playNextChunk() {
-      if (audioQueue.length === 0) {
-        isPlaying = false;
-        return;
-      }
-      isPlaying = true;
+      if (audioQueue.length === 0) return;
       const chunk = audioQueue.shift();
       player.src = `/api/assistant?tts=${encodeURIComponent(chunk)}`;
-      player.play().catch(() => { isPlaying = false; });
+      player.play().catch(() => {});
     }
 
     player.addEventListener('ended', playNextChunk);
@@ -152,7 +150,6 @@
       if (!prompt) return;
       input.value = '';
       stopAudio();
-      // Mở khóa audio iOS ngay trong thao tác chạm của người dùng
       player.play().catch(() => {});
 
       const replyBox = document.getElementById('reply');
@@ -173,23 +170,77 @@
       }
     }
 
-    function toggleMic() {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR) return alert('Trình duyệt không hỗ trợ Web Speech API. Bạn hãy chạm vào ô nhập chữ và dùng Micro trên bàn phím điện thoại nhé.');
-      const rec = new SR();
-      rec.lang = 'vi-VN';
+    async function toggleMic() {
       const btn = document.getElementById('mic-btn');
-      btn.classList.add('listening');
-      btn.textContent = '🔴 Đang nghe...';
-      rec.onresult = (e) => {
-        const text = e.results[0][0].transcript;
-        sendPrompt(text);
-      };
-      rec.onend = () => {
-        btn.classList.remove('listening');
-        btn.textContent = '🎙️ Nhấn để nói (Web Speech)';
-      };
-      rec.start();
+      const replyBox = document.getElementById('reply');
+
+      // Nếu đang ghi âm -> dừng lại và gửi lên Groq Whisper
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        clearTimeout(autoStopTimer);
+        mediaRecorder.stop();
+        return;
+      }
+
+      stopAudio();
+      // Mở khóa audio iOS ngay khi bấm nút
+      player.play().catch(() => {});
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return alert('Trình duyệt không hỗ trợ ghi âm Micro.');
+      }
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioChunks = [];
+        const mimeType = MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : 'audio/webm';
+        mediaRecorder = new MediaRecorder(mediaStream, { mimeType });
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+          btn.classList.remove('listening');
+          btn.textContent = '🎙️ Nhấn để nói (Whisper AI)';
+          if (mediaStream) {
+            mediaStream.getTracks().forEach(t => t.stop());
+            mediaStream = null;
+          }
+
+          const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+          const blob = new Blob(audioChunks, { type: mimeType });
+          if (blob.size < 500) {
+            replyBox.textContent = 'Chưa thu được tiếng, bạn bấm nói lại nhé.';
+            return;
+          }
+
+          replyBox.textContent = '🎧 Đang nghe và dịch giọng nói...';
+          const form = new FormData();
+          form.append('file', blob, `voice.${ext}`);
+
+          try {
+            const sttRes = await fetch('/api/assistant?stt=1', { method: 'POST', body: form });
+            const sttData = await sttRes.json();
+            if (sttData.text) {
+              replyBox.textContent = `🗣️ Bạn nói: "${sttData.text}"\n⏳ Đang trả lời...`;
+              await sendPrompt(sttData.text);
+            } else {
+              replyBox.textContent = sttData.error || 'Không nghe rõ giọng nói, bạn thử lại nhé.';
+            }
+          } catch (err) {
+            replyBox.textContent = 'Lỗi gửi âm thanh: ' + err.message;
+          }
+        };
+
+        mediaRecorder.start();
+        btn.classList.add('listening');
+        btn.textContent = '⏹️ Đang nghe... (Bấm để gửi)';
+        autoStopTimer = setTimeout(() => {
+          if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+        }, 10000);
+      } catch (err) {
+        alert('Không mở được Micro: ' + err.message);
+      }
     }
   </script>
 </body>
