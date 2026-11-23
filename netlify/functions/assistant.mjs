@@ -1,6 +1,6 @@
 // netlify/functions/assistant.mjs - Netlify Functions v2 (Zero-Cost Backend)
 // Hỗ trợ: 4 tính năng cốt lõi (Phần A) + 12 tính năng mở rộng (Phần B) + TTS MP3 tiếng Việt
-// Tự động fallback giữa gemini-3.8-flash -> gemini-3.6-flash -> gemini-3.5-flash-lite khi Google quá tải (503)
+// Ưu tiên Groq API miễn phí siêu tốc (openai/gpt-oss-120b / 20b), dự phòng Gemini API có timeout chống treo 10s
 
 export const config = {
   path: "/api/assistant"
@@ -17,12 +17,12 @@ export default async (req, context) => {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
 
-  // Hỗ trợ phát âm thanh MP3 tiếng Việt chuẩn Media cho điện thoại & PC: GET /api/assistant?tts=...
+  // Phát âm thanh MP3 tiếng Việt chuẩn Media cho điện thoại & PC: GET /api/assistant?tts=...
   if (req.method === "GET") {
     const reqUrl = new URL(req.url);
     const ttsText = reqUrl.searchParams.get("tts");
     if (!ttsText) {
-      return Response.json({ status: "ok", models: ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"] }, { status: 200, headers: corsHeaders });
+      return Response.json({ status: "ok", providers: ["groq", "gemini"] }, { status: 200, headers: corsHeaders });
     }
     try {
       const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(ttsText.slice(0, 200))}`;
@@ -49,11 +49,14 @@ export default async (req, context) => {
 
   const getEnv = (name) => (typeof Netlify !== "undefined" && Netlify.env ? Netlify.env.get(name) : undefined) || process.env[name];
 
+  const GROQ_API_KEY = getEnv("GROQ_API_KEY");
   const GEMINI_API_KEY = getEnv("GEMINI_API_KEY");
   const SUPABASE_URL = getEnv("SUPABASE_URL");
   const SUPABASE_KEY = getEnv("SUPABASE_ANON_KEY");
   const TELEGRAM_BOT_TOKEN = getEnv("TELEGRAM_BOT_TOKEN");
   const TELEGRAM_CHAT_ID = getEnv("TELEGRAM_CHAT_ID");
+
+  const askAI = (text) => callAI({ groqKey: GROQ_API_KEY, geminiKey: GEMINI_API_KEY, text });
 
   try {
     const body = await req.json().catch(() => ({}));
@@ -85,7 +88,7 @@ export default async (req, context) => {
         .map((m, i) => `${i + 1}. ${m[1]}`);
 
       const summaryPrompt = `Bạn là trợ lý AI trên xe hơi. Hãy đọc tóm tắt ngắn gọn, tự nhiên bằng tiếng Việt 5 tin tức nổi bật sau đây để tài xế dễ nghe trong 30 giây (không dùng markdown):\n${titles.join("\n")}`;
-      const reply = breakPrefix + await callGemini(GEMINI_API_KEY, summaryPrompt);
+      const reply = breakPrefix + await askAI(summaryPrompt);
       await logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "news", mode);
       return jsonReply({ intent: "news", reply, audioAction: "speak" });
     }
@@ -125,7 +128,7 @@ export default async (req, context) => {
           audioAction: "speak"
         });
       }
-      const msgText = await callGemini(GEMINI_API_KEY, `Chuyển câu lệnh giọng nói sau thành 1 tin nhắn ngắn gọn, lịch sự để gửi qua Telegram (chỉ trả về nội dung tin nhắn): "${prompt}"`);
+      const msgText = await askAI(`Chuyển câu lệnh giọng nói sau thành 1 tin nhắn ngắn gọn, lịch sự để gửi qua Telegram (chỉ trả về nội dung tin nhắn): "${prompt}"`);
       await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -143,7 +146,7 @@ export default async (req, context) => {
         return jsonReply({ intent: "notifications", reply: "Hiện không có thông báo công việc mới nào.", audioAction: "speak" });
       }
       const listText = notifs.map((n, i) => `${i + 1}. Từ ${n.source} (${n.sender || "Hệ thống"}): ${n.summary}`).join("\n");
-      const reply = await callGemini(GEMINI_API_KEY, `Tóm tắt ngắn gọn các thông báo sau để đọc thành tiếng (không dùng markdown):\n${listText}`);
+      const reply = await askAI(`Tóm tắt ngắn gọn các thông báo sau để đọc thành tiếng (không dùng markdown):\n${listText}`);
       return jsonReply({ intent: "notifications", reply, audioAction: "speak", ledColor: "blue" });
     }
 
@@ -151,7 +154,7 @@ export default async (req, context) => {
     if (lower.startsWith("ghi chú") || lower.startsWith("nhắc tôi") || lower.includes("lưu lại") || lower.includes("việc cần làm") || lower.includes("thêm task")) {
       const isTask = lower.includes("việc") || lower.includes("task") || lower.includes("nhắc tôi");
       if (isTask) {
-        const cleanTask = await callGemini(GEMINI_API_KEY, `Trích xuất tiêu đề việc cần làm ngắn gọn từ câu sau (chỉ trả về tiêu đề): "${prompt}"`);
+        const cleanTask = await askAI(`Trích xuất tiêu đề việc cần làm ngắn gọn từ câu sau (chỉ trả về tiêu đề): "${prompt}"`);
         await sbInsert(SUPABASE_URL, SUPABASE_KEY, "tasks", { title: cleanTask.trim(), source: "voice", priority: "normal" });
         return jsonReply({ intent: "voice_to_task", reply: `Đã thêm việc cần làm: ${cleanTask.trim()}`, audioAction: "speak" });
       } else {
@@ -167,25 +170,25 @@ export default async (req, context) => {
       const wJson = await wRes.json();
       const cur = wJson?.current_condition?.[0];
       const weatherInfo = cur ? `Nhiệt độ ${cur.temp_C}°C, độ ẩm ${cur.humidity}%, gió ${cur.windspeedKmph} km/h, tình trạng: ${cur.weatherDesc?.[0]?.value}` : "Không lấy được dữ liệu chi tiết";
-      const reply = await callGemini(GEMINI_API_KEY, `Dựa trên dữ liệu thời tiết tại ${targetCity}: ${weatherInfo}. Hãy cảnh báo ngắn gọn cho tài xế trong 2 câu (không markdown).`);
+      const reply = await askAI(`Dựa trên dữ liệu thời tiết tại ${targetCity}: ${weatherInfo}. Hãy cảnh báo ngắn gọn cho tài xế trong 2 câu tiếng Việt (không markdown).`);
       return jsonReply({ intent: "weather", reply: breakPrefix + reply, audioAction: "speak" });
     }
 
     // 7. CHẾ ĐỘ "TÀI XẾ TỈNH TÁO" CHỐNG BUỒN NGỦ
     if (lower.includes("buồn ngủ") || lower.includes("tỉnh táo") || lower.includes("lái xe đêm")) {
-      const reply = await callGemini(GEMINI_API_KEY, "Tài xế đang hơi buồn ngủ. Hãy nói 1 câu khích lệ tỉnh táo thật ngắn, rồi đố vui 1 câu đố mẹo hoặc hỏi 1 câu tương tác nhanh để tài xế trả lời (không dùng markdown).");
+      const reply = await askAI("Tài xế đang hơi buồn ngủ. Hãy nói 1 câu khích lệ tỉnh táo thật ngắn bằng tiếng Việt, rồi đố vui 1 câu đố mẹo hoặc hỏi 1 câu tương tác nhanh để tài xế trả lời (không dùng markdown).");
       return jsonReply({ intent: "awake_mode", reply, audioAction: "speak", ledColor: "red" });
     }
 
     // 8. HỎI ĐÁP LUẬT GIAO THÔNG & XỬ LÝ LỖI XE TỨC THÌ
     if (lower.includes("luật") || lower.includes("phạt") || lower.includes("biển báo") || lower.includes("đèn báo") || lower.includes("check engine") || lower.includes("lỗi xe")) {
-      const reply = await callGemini(GEMINI_API_KEY, `Bạn là chuyên gia kỹ thuật ô tô và Luật giao thông đường bộ Việt Nam. Hãy trả lời câu hỏi sau thật ngắn gọn, chuẩn xác để tài xế nghe trong 15 giây (không markdown):\n${prompt}`);
+      const reply = await askAI(`Bạn là chuyên gia kỹ thuật ô tô và Luật giao thông đường bộ Việt Nam. Hãy trả lời câu hỏi sau bằng tiếng Việt thật ngắn gọn, chuẩn xác để tài xế nghe trong 15 giây (không markdown):\n${prompt}`);
       return jsonReply({ intent: "traffic_auto", reply: breakPrefix + reply, audioAction: "speak" });
     }
 
     // 9. LUYỆN PHẢN XẠ GIAO TIẾP NGOẠI NGỮ 2 CHIỀU
     if (lower.includes("tiếng anh") || lower.includes("ngoại ngữ") || lower.includes("luyện nói")) {
-      const reply = await callGemini(GEMINI_API_KEY, `Bạn là giáo viên luyện phản xạ tiếng Anh trên xe hơi. Hãy nói 1 câu tiếng Anh tự nhiên liên quan đến chủ đề người dùng nêu, kèm giải thích tiếng Việt ngắn và gợi ý để tài xế nói lại (không markdown):\n${prompt}`);
+      const reply = await askAI(`Bạn là giáo viên luyện phản xạ tiếng Anh trên xe hơi. Hãy nói 1 câu tiếng Anh tự nhiên liên quan đến chủ đề người dùng nêu, kèm giải thích tiếng Việt ngắn và gợi ý để tài xế nói lại (không markdown):\n${prompt}`);
       return jsonReply({ intent: "language_practice", reply, audioAction: "speak" });
     }
 
@@ -215,7 +218,7 @@ export default async (req, context) => {
 
     // 12. KỂ CHUYỆN / PODCAST AI ĐƯỜNG DÀI
     if (lower.includes("kể chuyện") || lower.includes("podcast")) {
-      const reply = await callGemini(GEMINI_API_KEY, `Hãy kể một câu chuyện hoặc làm một đoạn mini-podcast 2 phút thật lôi cuốn, giọng văn tự nhiên để nghe khi lái xe đường dài về yêu cầu sau (không markdown):\n${prompt}`);
+      const reply = await askAI(`Hãy kể một câu chuyện hoặc làm một đoạn mini-podcast 2 phút bằng tiếng Việt thật lôi cuốn, giọng văn tự nhiên để nghe khi lái xe đường dài về yêu cầu sau (không markdown):\n${prompt}`);
       return jsonReply({ intent: "podcast", reply: breakPrefix + reply, audioAction: "speak" });
     }
 
@@ -231,10 +234,10 @@ export default async (req, context) => {
 
     // 14. TRÒ CHUYỆN AI THÔNG THƯỜNG
     const systemContext = mode === "car"
-      ? "Bạn là trợ lý AI đồng hành trên xe hơi. Trả lời ngắn gọn, súc tích, thân thiện, không dùng dấu sao hay ký hiệu markdown để đọc thành tiếng tự nhiên."
-      : "Bạn là trợ lý AI trên bàn làm việc. Trả lời thông minh, rõ ràng, không dùng markdown để đọc thành tiếng tự nhiên.";
+      ? "Bạn là trợ lý AI đồng hành trên xe hơi. Trả lời bằng tiếng Việt ngắn gọn, súc tích, thân thiện, không dùng dấu sao hay ký hiệu markdown."
+      : "Bạn là trợ lý AI trên bàn làm việc. Trả lời bằng tiếng Việt thông minh, rõ ràng, không dùng markdown.";
 
-    const reply = breakPrefix + await callGemini(GEMINI_API_KEY, `${systemContext}\nNgười dùng: ${prompt}`);
+    const reply = breakPrefix + await askAI(`${systemContext}\nNgười dùng: ${prompt}`);
     await logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "chat", mode);
     return jsonReply({ intent: "chat", reply, audioAction: "speak" });
 
@@ -273,29 +276,66 @@ async function logChat(url, key, user_query, ai_reply, intent, device_mode) {
   await sbInsert(url, key, "assistant_logs", { user_query, ai_reply, intent, device_mode });
 }
 
-async function callGemini(apiKey, text) {
-  if (!apiKey) return "Chưa cấu hình GEMINI_API_KEY trên máy chủ Netlify.";
-  const models = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"];
-  let lastErr = "Không kết nối được tới Gemini.";
+async function fetchWithTimeout(url, options, ms = 6500) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
 
-  for (const model of models) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey.trim()
-      },
-      body: JSON.stringify({ contents: [{ parts: [{ text }] }] })
-    });
-    const data = await resp.json();
-    const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (reply) return reply;
-    if (data?.error) {
-      lastErr = `Lỗi Gemini (${data.error.code}): ${data.error.message}`;
-      if (data.error.code === 503 || data.error.code === 429) continue;
-      return lastErr;
+async function callAI({ groqKey, geminiKey, text }) {
+  // 1. Ưu tiên GroqCloud miễn phí siêu tốc (< 0.5 giây)
+  if (groqKey) {
+    const groqModels = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+    for (const model of groqModels) {
+      try {
+        const resp = await fetchWithTimeout("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${groqKey.trim()}`
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: text }],
+            temperature: 0.7
+          })
+        }, 6500);
+        const data = await resp.json();
+        const reply = data?.choices?.[0]?.message?.content;
+        if (reply) return reply.trim();
+        if (data?.error && resp.status !== 429 && resp.status !== 503) {
+          return `Lỗi Groq (${resp.status}): ${data.error.message}`;
+        }
+      } catch (e) {
+        // Thử model tiếp theo nếu timeout
+      }
     }
   }
-  return lastErr;
+
+  // 2. Dự phòng Gemini API (có giới hạn 6.5 giây để không bị treo Netlify)
+  if (geminiKey) {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
+    try {
+      const resp = await fetchWithTimeout(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": geminiKey.trim()
+        },
+        body: JSON.stringify({ contents: [{ parts: [{ text }] }] })
+      }, 6500);
+      const data = await resp.json();
+      if (data.error) return `Lỗi Gemini (${data.error.code}): ${data.error.message}`;
+      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (reply) return reply;
+    } catch (e) {
+      return "Máy chủ AI đang phản hồi chậm quá 6 giây, bạn bấm thử lại nhé.";
+    }
+  }
+
+  return "Chưa cấu hình GROQ_API_KEY hoặc GEMINI_API_KEY trên Netlify.";
 }
