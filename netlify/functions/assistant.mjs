@@ -1,6 +1,5 @@
 // netlify/functions/assistant.mjs - Netlify Functions v2 (Zero-Cost Backend)
-// Hỗ trợ: 4 tính năng cốt lõi (Phần A) + 12 tính năng mở rộng (Phần B) + TTS MP3 tiếng Việt
-// Ưu tiên Groq API miễn phí siêu tốc (openai/gpt-oss-120b / 20b), dự phòng Gemini API có timeout chống treo 10s
+// Hỗ trợ: 4 tính năng cốt lõi (Phần A) + 12 tính năng mở rộng (Phần B) + TTS MP3 + STT Groq Whisper tiếng Việt
 
 export const config = {
   path: "/api/assistant"
@@ -22,7 +21,7 @@ export default async (req, context) => {
     const reqUrl = new URL(req.url);
     const ttsText = reqUrl.searchParams.get("tts");
     if (!ttsText) {
-      return Response.json({ status: "ok", providers: ["groq", "gemini"] }, { status: 200, headers: corsHeaders });
+      return Response.json({ status: "ok", providers: ["groq", "gemini", "whisper"] }, { status: 200, headers: corsHeaders });
     }
     try {
       const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(ttsText.slice(0, 200))}`;
@@ -56,6 +55,38 @@ export default async (req, context) => {
   const TELEGRAM_BOT_TOKEN = getEnv("TELEGRAM_BOT_TOKEN");
   const TELEGRAM_CHAT_ID = getEnv("TELEGRAM_CHAT_ID");
 
+  // Chuyển giọng nói thành văn bản (STT) qua Groq Whisper: POST /api/assistant?stt=1
+  const reqUrl = new URL(req.url);
+  if (reqUrl.searchParams.get("stt") === "1") {
+    if (!GROQ_API_KEY) {
+      return Response.json({ error: "Chưa cấu hình GROQ_API_KEY để nhận diện giọng nói." }, { status: 400, headers: corsHeaders });
+    }
+    try {
+      const incomingForm = await req.formData();
+      const audioFile = incomingForm.get("file");
+      if (!audioFile) {
+        return Response.json({ error: "Không nhận được file âm thanh từ micro." }, { status: 400, headers: corsHeaders });
+      }
+      const groqForm = new FormData();
+      groqForm.append("file", audioFile, audioFile.name || "voice.mp4");
+      groqForm.append("model", "whisper-large-v3-turbo");
+      groqForm.append("language", "vi");
+
+      const sttRes = await fetchWithTimeout("https://api.groq.com/openai/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${GROQ_API_KEY.trim()}` },
+        body: groqForm
+      }, 8000);
+      const sttData = await sttRes.json();
+      if (sttData.error) {
+        return Response.json({ error: sttData.error.message }, { status: 500, headers: corsHeaders });
+      }
+      return Response.json({ text: (sttData.text || "").trim() }, { status: 200, headers: corsHeaders });
+    } catch (e) {
+      return Response.json({ error: "Lỗi nhận diện giọng nói: " + e.message }, { status: 500, headers: corsHeaders });
+    }
+  }
+
   const askAI = (text) => callAI({ groqKey: GROQ_API_KEY, geminiKey: GEMINI_API_KEY, text });
 
   try {
@@ -79,15 +110,13 @@ export default async (req, context) => {
 
     const jsonReply = (payload, status = 200) => Response.json(payload, { status, headers: corsHeaders });
 
-    // 1. ĐIỂM TIN TỨC TRONG NGÀY (RSS VnExpress)
+    // 1. ĐIỂM TIN TỨC TRONG NGÀY (RSS VnExpress + dự phòng Tuổi Trẻ)
     if (lower.includes("tin tức") || lower.includes("điểm tin") || lower.includes("báo mới")) {
-      const rssRes = await fetch("https://vnexpress.net/rss/tin-moi-nhat.rss");
-      const rssXml = await rssRes.text();
-      const titles = [...rssXml.matchAll(/<title><!\[CDATA\[(.*?)\]\]><\/title>/g)]
-        .slice(1, 6)
-        .map((m, i) => `${i + 1}. ${m[1]}`);
-
-      const summaryPrompt = `Bạn là trợ lý AI trên xe hơi. Hãy đọc tóm tắt ngắn gọn, tự nhiên bằng tiếng Việt 5 tin tức nổi bật sau đây để tài xế dễ nghe trong 30 giây (không dùng markdown):\n${titles.join("\n")}`;
+      const titles = await fetchLatestNewsTitles();
+      if (titles.length === 0) {
+        return jsonReply({ intent: "news", reply: "Hiện không lấy được nguồn tin RSS từ báo điện tử, bạn thử lại sau ít phút nhé.", audioAction: "speak" });
+      }
+      const summaryPrompt = `Bạn là trợ lý AI trên xe hơi. Hãy đọc tóm tắt tự nhiên, mạch lạc bằng tiếng Việt 5 tin tức nổi bật sau đây thành bản tin ngắn 30 giây cho tài xế nghe (không dùng dấu sao hay ký hiệu markdown):\n${titles.join("\n")}`;
       const reply = breakPrefix + await askAI(summaryPrompt);
       await logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "news", mode);
       return jsonReply({ intent: "news", reply, audioAction: "speak" });
@@ -246,6 +275,28 @@ export default async (req, context) => {
   }
 };
 
+async function fetchLatestNewsTitles() {
+  const feeds = [
+    "https://vnexpress.net/rss/tin-moi-nhat.rss",
+    "https://tuoitre.vn/rss/tin-moi-nhat.rss"
+  ];
+  for (const feedUrl of feeds) {
+    try {
+      const res = await fetchWithTimeout(feedUrl, {
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+      }, 4500);
+      if (!res.ok) continue;
+      const xml = await res.text();
+      const matches = [...xml.matchAll(/<item>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/gi)];
+      const titles = matches.slice(0, 5).map((m, i) => `${i + 1}. ${m[1].trim()}`);
+      if (titles.length > 0) return titles;
+    } catch (e) {
+      // Thử nguồn báo tiếp theo
+    }
+  }
+  return [];
+}
+
 function buildSbHeaders(key, extra = {}) {
   const headers = { apikey: key, ...extra };
   if (key && key.startsWith("eyJ")) {
@@ -287,7 +338,6 @@ async function fetchWithTimeout(url, options, ms = 6500) {
 }
 
 async function callAI({ groqKey, geminiKey, text }) {
-  // 1. Ưu tiên GroqCloud miễn phí siêu tốc (< 0.5 giây)
   if (groqKey) {
     const groqModels = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
     for (const model of groqModels) {
@@ -310,13 +360,10 @@ async function callAI({ groqKey, geminiKey, text }) {
         if (data?.error && resp.status !== 429 && resp.status !== 503) {
           return `Lỗi Groq (${resp.status}): ${data.error.message}`;
         }
-      } catch (e) {
-        // Thử model tiếp theo nếu timeout
-      }
+      } catch (e) {}
     }
   }
 
-  // 2. Dự phòng Gemini API (có giới hạn 6.5 giây để không bị treo Netlify)
   if (geminiKey) {
     const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
     try {
