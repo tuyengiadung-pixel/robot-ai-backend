@@ -1,6 +1,6 @@
 // netlify/functions/assistant.mjs - Netlify Functions v2 (Zero-Cost Backend)
-// Hỗ trợ: 4 tính năng cốt lõi (Phần A) + 12 tính năng mở rộng (Phần B)
-// Tương thích khóa Supabase mới (sb_secret_ / sb_publishable_) và khóa Gemini mới (AQ. / AIza...)
+// Hỗ trợ: 4 tính năng cốt lõi (Phần A) + 12 tính năng mở rộng (Phần B) + TTS MP3 tiếng Việt
+// Dùng model gemini-3.8-flash + khóa Supabase mới (sb_secret_ / sb_publishable_)
 
 export const config = {
   path: "/api/assistant"
@@ -9,13 +9,40 @@ export const config = {
 export default async (req, context) => {
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type"
   };
 
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
+
+  // Hỗ trợ phát âm thanh MP3 tiếng Việt chuẩn Media cho điện thoại & PC: GET /api/assistant?tts=...
+  if (req.method === "GET") {
+    const reqUrl = new URL(req.url);
+    const ttsText = reqUrl.searchParams.get("tts");
+    if (!ttsText) {
+      return Response.json({ status: "ok", model: "gemini-3.8-flash" }, { status: 200, headers: corsHeaders });
+    }
+    try {
+      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(ttsText.slice(0, 200))}`;
+      const audioRes = await fetch(ttsUrl, {
+        headers: { "User-Agent": "Mozilla/5.0" }
+      });
+      const buf = await audioRes.arrayBuffer();
+      return new Response(buf, {
+        status: 200,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "audio/mpeg",
+          "Cache-Control": "public, max-age=3600"
+        }
+      });
+    } catch (e) {
+      return Response.json({ error: e.message }, { status: 500, headers: corsHeaders });
+    }
+  }
+
   if (req.method !== "POST") {
     return Response.json({ error: "Method Not Allowed" }, { status: 405, headers: corsHeaders });
   }
@@ -248,7 +275,7 @@ async function logChat(url, key, user_query, ai_reply, intent, device_mode) {
 
 async function callGemini(apiKey, text) {
   if (!apiKey) return "Chưa cấu hình GEMINI_API_KEY trên máy chủ Netlify.";
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent";
   const resp = await fetch(url, {
     method: "POST",
     headers: {
