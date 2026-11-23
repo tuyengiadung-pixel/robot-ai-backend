@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Robot Trợ Lý AI — Web Simulator (4 + 12 Tính năng)</title>
+  <style>
+    :root { --bg: #0f172a; --card: #1e293b; --accent: #38bdf8; --text: #f8fafc; --muted: #94a3b8; }
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; background: var(--bg); color: var(--text); padding: 16px; display: flex; justify-content: center; }
+    .app { width: 100%; max-width: 540px; display: flex; flex-direction: column; gap: 14px; }
+    .screen { background: linear-gradient(145deg, #0b1120, #1e293b); border: 2px solid #334155; border-radius: 20px; padding: 18px; box-shadow: 0 12px 30px rgba(0,0,0,0.4); }
+    .top-bar { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+    .mode-switch { display: flex; gap: 8px; }
+    .mode-btn { flex: 1; padding: 10px; border: 1px solid #334155; border-radius: 12px; background: var(--card); color: var(--text); cursor: pointer; font-weight: 600; }
+    .mode-btn.active { background: var(--accent); color: #0f172a; border-color: var(--accent); }
+    .reply-box { min-height: 96px; font-size: 15px; line-height: 1.5; color: #e2e8f0; margin-top: 8px; }
+    .chips { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .chip { background: var(--card); border: 1px solid #334155; color: var(--text); padding: 10px 12px; border-radius: 12px; font-size: 13px; text-align: left; cursor: pointer; }
+    .chip:hover { border-color: var(--accent); }
+    .input-row { display: flex; gap: 8px; }
+    input[type="text"] { flex: 1; padding: 12px 14px; border-radius: 14px; border: 1px solid #334155; background: var(--card); color: var(--text); font-size: 15px; }
+    .send-btn { padding: 12px 18px; border-radius: 14px; border: none; background: var(--accent); color: #0f172a; font-weight: 700; cursor: pointer; }
+    .mic-btn { width: 100%; padding: 14px; border-radius: 16px; border: none; background: #10b981; color: #052e16; font-size: 16px; font-weight: 700; cursor: pointer; }
+    .mic-btn.listening { background: #ef4444; color: #fff; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="mode-switch">
+      <button class="mode-btn active" onclick="setMode('car', this)">🚗 Xe hơi (Bluetooth)</button>
+      <button class="mode-btn" onclick="setMode('desk', this)">💻 Bàn làm việc</button>
+    </div>
+
+    <div class="screen">
+      <div class="top-bar">
+        <span id="clock">08:30</span>
+        <span id="status-badge">Sẵn sàng • Lái xe: 0 phút</span>
+      </div>
+      <div class="reply-box" id="reply">Xin chào Phong! Bấm Micro hoặc chọn nhanh 1 tính năng bên dưới để test Backend Vercel.</div>
+    </div>
+
+    <div class="chips">
+      <button class="chip" onclick="sendPrompt('Điểm tin tức hôm nay')">📰 Điểm tin RSS</button>
+      <button class="chip" onclick="sendPrompt('Mở nhạc từ thẻ nhớ')">🎵 Nhạc Offline / Cloud</button>
+      <button class="chip" onclick="sendPrompt('Thời tiết tuyến đường hôm nay thế nào')">🌦️ Thời tiết tuyến đường</button>
+      <button class="chip" onclick="sendPrompt('Đèn check engine sáng vàng có đi tiếp được không')">🚦 Luật GT & Lỗi xe</button>
+      <button class="chip" onclick="sendPrompt('Nhắn Telegram là 15 phút nữa anh về tới nhà')">✈️ Nhắn Telegram</button>
+      <button class="chip" onclick="sendPrompt('Đọc thông báo công việc mới')">🔔 Đọc thông báo</button>
+      <button class="chip" onclick="sendPrompt('Thêm việc cần làm: đặt bo ES3C28P')">✅ Voice-to-Task</button>
+      <button class="chip" onclick="sendPrompt('Lịch hôm nay có gì')">📅 Smart Clock & Lịch</button>
+      <button class="chip" onclick="sendPrompt('Tôi hơi buồn ngủ khi lái xe đêm')">☕ Tài xế tỉnh táo</button>
+      <button class="chip" onclick="sendPrompt('Luyện tiếng Anh giao tiếp trên xe')">🗣️ Luyện ngoại ngữ</button>
+      <button class="chip" onclick="sendPrompt('Bật đồng hồ Pomodoro tập trung')">🍅 Pomodoro 25 phút</button>
+      <button class="chip" onclick="sendPrompt('Kể chuyện lịch sử 2 phút')">🎙️ Podcast / Sách nói</button>
+    </div>
+
+    <div class="input-row">
+      <input id="prompt-input" type="text" placeholder="Nhập hoặc nói câu lệnh..." onkeydown="if(event.key==='Enter') sendPrompt()" />
+      <button class="send-btn" onclick="sendPrompt()">Gửi</button>
+    </div>
+    <button class="mic-btn" id="mic-btn" onclick="toggleMic()">🎙️ Nhấn để nói (Web Speech)</button>
+  </div>
+
+  <script>
+    let currentMode = 'car';
+    let drivingMinutes = 0;
+
+    setInterval(() => {
+      const now = new Date();
+      document.getElementById('clock').textContent = now.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+      if (currentMode === 'car') {
+        drivingMinutes++;
+        document.getElementById('status-badge').textContent = `Xe hơi • Lái xe: ${drivingMinutes} phút`;
+      }
+    }, 60000);
+
+    function setMode(mode, el) {
+      currentMode = mode;
+      document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+      el.classList.add('active');
+      document.getElementById('status-badge').textContent = mode === 'car' ? `Xe hơi • Lái xe: ${drivingMinutes} phút` : 'Bàn làm việc • Loa tích hợp';
+    }
+
+    async function sendPrompt(customText) {
+      const input = document.getElementById('prompt-input');
+      const prompt = customText || input.value.trim();
+      if (!prompt) return;
+      input.value = '';
+      const replyBox = document.getElementById('reply');
+      replyBox.textContent = '⏳ Đang xử lý...';
+
+      try {
+        const res = await fetch('/api/assistant', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt, mode: currentMode, drivingMinutes })
+        });
+        const data = await res.json();
+        replyBox.textContent = data.reply || data.error || 'Không có phản hồi';
+        if (data.reply && 'speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+          const u = new SpeechSynthesisUtterance(data.reply);
+          u.lang = 'vi-VN';
+          window.speechSynthesis.speak(u);
+        }
+      } catch (e) {
+        replyBox.textContent = 'Lỗi kết nối Backend: ' + e.message;
+      }
+    }
+
+    function toggleMic() {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SR) return alert('Trình duyệt không hỗ trợ Web Speech API.');
+      const rec = new SR();
+      rec.lang = 'vi-VN';
+      const btn = document.getElementById('mic-btn');
+      btn.classList.add('listening');
+      btn.textContent = '🔴 Đang nghe...';
+      rec.onresult = (e) => {
+        const text = e.results[0][0].transcript;
+        sendPrompt(text);
+      };
+      rec.onend = () => {
+        btn.classList.remove('listening');
+        btn.textContent = '🎙️ Nhấn để nói (Web Speech)';
+      };
+      rec.start();
+    }
+  </script>
+</body>
+</html>
