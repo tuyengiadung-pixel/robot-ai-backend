@@ -1,6 +1,6 @@
 // netlify/functions/assistant.mjs - Netlify Functions v2 (Zero-Cost Backend)
 // Hỗ trợ: 4 tính năng cốt lõi (Phần A) + 12 tính năng mở rộng (Phần B) + TTS MP3 tiếng Việt
-// Dùng model gemini-3.8-flash + khóa Supabase mới (sb_secret_ / sb_publishable_)
+// Tự động fallback giữa gemini-3.8-flash -> gemini-3.6-flash -> gemini-3.5-flash-lite khi Google quá tải (503)
 
 export const config = {
   path: "/api/assistant"
@@ -22,7 +22,7 @@ export default async (req, context) => {
     const reqUrl = new URL(req.url);
     const ttsText = reqUrl.searchParams.get("tts");
     if (!ttsText) {
-      return Response.json({ status: "ok", model: "gemini-3.8-flash" }, { status: 200, headers: corsHeaders });
+      return Response.json({ status: "ok", models: ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"] }, { status: 200, headers: corsHeaders });
     }
     try {
       const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(ttsText.slice(0, 200))}`;
@@ -275,16 +275,27 @@ async function logChat(url, key, user_query, ai_reply, intent, device_mode) {
 
 async function callGemini(apiKey, text) {
   if (!apiKey) return "Chưa cấu hình GEMINI_API_KEY trên máy chủ Netlify.";
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent";
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey.trim()
-    },
-    body: JSON.stringify({ contents: [{ parts: [{ text }] }] })
-  });
-  const data = await resp.json();
-  if (data.error) return `Lỗi Gemini (${data.error.code}): ${data.error.message}`;
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text || "Xin lỗi, tôi chưa nghe rõ.";
+  const models = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"];
+  let lastErr = "Không kết nối được tới Gemini.";
+
+  for (const model of models) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey.trim()
+      },
+      body: JSON.stringify({ contents: [{ parts: [{ text }] }] })
+    });
+    const data = await resp.json();
+    const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (reply) return reply;
+    if (data?.error) {
+      lastErr = `Lỗi Gemini (${data.error.code}): ${data.error.message}`;
+      if (data.error.code === 503 || data.error.code === 429) continue;
+      return lastErr;
+    }
+  }
+  return lastErr;
 }
