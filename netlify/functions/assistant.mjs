@@ -1,6 +1,6 @@
 // netlify/functions/assistant.mjs - Netlify Functions v2 (Zero-Cost Backend)
 // Hỗ trợ: 4 tính năng cốt lõi (Phần A) + 12 tính năng mở rộng (Phần B)
-// Tương thích cả khóa Supabase mới (sb_secret_ / sb_publishable_) lẫn khóa cũ (eyJ...)
+// Tương thích khóa Supabase mới (sb_secret_ / sb_publishable_) và khóa Gemini mới (AQ. / AIza...)
 
 export const config = {
   path: "/api/assistant"
@@ -248,12 +248,16 @@ async function logChat(url, key, user_query, ai_reply, intent, device_mode) {
 
 async function callGemini(apiKey, text) {
   if (!apiKey) return "Chưa cấu hình GEMINI_API_KEY trên máy chủ Netlify.";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey.trim()
+    },
     body: JSON.stringify({ contents: [{ parts: [{ text }] }] })
   });
   const data = await resp.json();
+  if (data.error) return `Lỗi Gemini (${data.error.code}): ${data.error.message}`;
   return data?.candidates?.[0]?.content?.parts?.[0]?.text || "Xin lỗi, tôi chưa nghe rõ.";
 }
