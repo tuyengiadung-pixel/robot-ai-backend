@@ -17,6 +17,7 @@
     .reply-box { min-height: 96px; font-size: 15px; line-height: 1.55; color: #e2e8f0; margin-top: 8px; white-space: pre-wrap; }
     .audio-bar { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 10px; }
     .stop-btn { background: #334155; color: #f8fafc; border: none; padding: 6px 12px; border-radius: 10px; font-size: 12px; cursor: pointer; }
+    .play-btn { background: #0284c7; color: #fff; border: none; padding: 6px 12px; border-radius: 10px; font-size: 12px; cursor: pointer; }
     .chips { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
     .chip { background: var(--card); border: 1px solid #334155; color: var(--text); padding: 10px 12px; border-radius: 12px; font-size: 13px; text-align: left; cursor: pointer; }
     .chip:hover { border-color: var(--accent); }
@@ -41,6 +42,7 @@
       </div>
       <div class="reply-box" id="reply">Xin chào Phong! Bấm nút Micro màu xanh bên dưới để nói (bấm lần 2 để gửi ngay), hoặc chọn nhanh tính năng.</div>
       <div class="audio-bar">
+        <button class="play-btn" onclick="replayLast()">🔊 Nghe lại</button>
         <button class="stop-btn" onclick="stopAudio()">🔇 Dừng đọc</button>
       </div>
     </div>
@@ -71,8 +73,8 @@
   <script>
     let currentMode = 'car';
     let drivingMinutes = 0;
-    let audioUrls = [];
-    let currentIdx = 0;
+    let audioQueue = [];
+    let lastReplyText = '';
     let mediaRecorder = null;
     let mediaStream = null;
     let audioChunks = [];
@@ -96,16 +98,15 @@
     }
 
     function stopAudio() {
-      audioUrls.forEach(u => { if (u.startsWith('blob:')) URL.revokeObjectURL(u); });
-      audioUrls = [];
-      currentIdx = 0;
+      audioQueue = [];
       player.pause();
-      player.src = '';
+      player.removeAttribute('src');
+      player.load();
     }
 
-    function splitChunks(text, maxLen = 500) {
+    function splitChunks(text, maxLen = 180) {
       const clean = text.replace(/\n+/g, '. ').trim();
-      if (clean.length <= maxLen) return [clean];
+      if (!clean) return [];
       const sentences = clean.split(/(?<=[.!?])\s+/);
       const chunks = [];
       let current = '';
@@ -114,34 +115,46 @@
           current = (current + ' ' + s).trim();
         } else {
           if (current) chunks.push(current);
-          current = s;
+          if (s.length <= maxLen) {
+            current = s;
+          } else {
+            const words = s.split(' ');
+            current = '';
+            for (const w of words) {
+              if ((current + ' ' + w).trim().length <= maxLen) {
+                current = (current + ' ' + w).trim();
+              } else {
+                if (current) chunks.push(current);
+                current = w;
+              }
+            }
+          }
         }
       }
       if (current) chunks.push(current);
       return chunks;
     }
 
-    async function speakVietnamese(text) {
-      stopAudio();
-      const chunks = splitChunks(text, 500);
-      if (chunks.length === 0) return;
-
-      // Phát ngay đoạn đầu và tải song song đoạn sau để không bị khựng
-      const url0 = `/api/assistant?tts=${encodeURIComponent(chunks[0])}`;
-      player.src = url0;
+    function playNextChunk() {
+      if (audioQueue.length === 0) return;
+      const chunk = audioQueue.shift();
+      player.src = `/api/assistant?tts=${encodeURIComponent(chunk)}`;
       player.play().catch(() => {});
-
-      if (chunks.length > 1) {
-        audioUrls = chunks.slice(1).map(c => `/api/assistant?tts=${encodeURIComponent(c)}`);
-      }
     }
 
-    player.addEventListener('ended', () => {
-      if (currentIdx < audioUrls.length) {
-        player.src = audioUrls[currentIdx++];
-        player.play().catch(() => {});
-      }
-    });
+    player.addEventListener('ended', playNextChunk);
+    player.addEventListener('error', playNextChunk);
+
+    function speakVietnamese(text) {
+      stopAudio();
+      lastReplyText = text;
+      audioQueue = splitChunks(text, 180);
+      playNextChunk();
+    }
+
+    function replayLast() {
+      if (lastReplyText) speakVietnamese(lastReplyText);
+    }
 
     async function sendPrompt(customText) {
       const input = document.getElementById('prompt-input');
@@ -149,7 +162,6 @@
       if (!prompt) return;
       input.value = '';
       stopAudio();
-      player.play().catch(() => {});
 
       const replyBox = document.getElementById('reply');
       replyBox.textContent = '⏳ Đang xử lý...';
@@ -180,7 +192,6 @@
       }
 
       stopAudio();
-      player.play().catch(() => {});
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         return alert('Trình duyệt không hỗ trợ ghi âm Micro.');
