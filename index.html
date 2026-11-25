@@ -73,13 +73,14 @@
   <script>
     let currentMode = 'car';
     let drivingMinutes = 0;
-    let audioQueue = [];
     let lastReplyText = '';
+    let lastNewsList = [];
     let mediaRecorder = null;
     let mediaStream = null;
     let audioChunks = [];
     let autoStopTimer = null;
     const player = document.getElementById('tts-player');
+    const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
 
     setInterval(() => {
       const now = new Date();
@@ -97,82 +98,40 @@
       document.getElementById('status-badge').textContent = mode === 'car' ? `Xe hơi • Lái xe: ${drivingMinutes} phút` : 'Bàn làm việc • Loa tích hợp';
     }
 
+    function unlockIOSAudio() {
+      player.pause();
+      player.src = SILENT_WAV;
+      player.play().catch(() => {});
+    }
+
     function stopAudio() {
-      audioQueue = [];
       player.pause();
       player.removeAttribute('src');
       player.load();
     }
 
-    function splitChunks(text, maxLen = 180) {
-      const clean = text.replace(/\n+/g, '. ').trim();
-      if (!clean) return [];
-      const sentences = clean.split(/(?<=[.!?])\s+/);
-      const chunks = [];
-      let current = '';
-      for (const s of sentences) {
-        if ((current + ' ' + s).trim().length <= maxLen) {
-          current = (current + ' ' + s).trim();
-        } else {
-          if (current) chunks.push(current);
-          if (s.length <= maxLen) {
-            current = s;
-          } else {
-            const words = s.split(' ');
-            current = '';
-            for (const w of words) {
-              if ((current + ' ' + w).trim().length <= maxLen) {
-                current = (current + ' ' + w).trim();
-              } else {
-                if (current) chunks.push(current);
-                current = w;
-              }
-            }
-          }
-        }
-      }
-      if (current) chunks.push(current);
-      return chunks;
-    }
-
-    function playNextChunk() {
-      if (audioQueue.length === 0) return;
-      const chunk = audioQueue.shift();
-      player.src = `/api/assistant?tts=${encodeURIComponent(chunk)}`;
-      player.play().catch(() => {});
-    }
-
-    player.addEventListener('ended', playNextChunk);
-    player.addEventListener('error', playNextChunk);
-
     function speakVietnamese(text) {
-      stopAudio();
-      lastReplyText = text;
-      audioQueue = splitChunks(text, 180);
-      playNextChunk();
+      const clean = (text || '').replace(/\n+/g, '. ').trim().slice(0, 1000);
+      if (!clean) return;
+      lastReplyText = clean;
+      player.src = `/api/assistant?tts=${encodeURIComponent(clean)}`;
+      player.play().catch(() => {});
     }
 
     function replayLast() {
       if (lastReplyText) speakVietnamese(lastReplyText);
     }
 
-    async function sendPrompt(customText) {
-      const input = document.getElementById('prompt-input');
-      const prompt = customText || input.value.trim();
-      if (!prompt) return;
-      input.value = '';
-      stopAudio();
-
+    async function callAssistant(prompt) {
       const replyBox = document.getElementById('reply');
-      replyBox.textContent = '⏳ Đang xử lý...';
-
       try {
         const res = await fetch('/api/assistant', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, mode: currentMode, drivingMinutes })
+          body: JSON.stringify({ prompt, mode: currentMode, drivingMinutes, newsContext: lastNewsList })
         });
         const data = await res.json();
+        if (Array.isArray(data.newsList)) lastNewsList = data.newsList;
         const text = data.reply || data.error || 'Không có phản hồi';
         replyBox.textContent = text;
         speakVietnamese(text);
@@ -181,17 +140,28 @@
       }
     }
 
+    async function sendPrompt(customText) {
+      const input = document.getElementById('prompt-input');
+      const prompt = customText || input.value.trim();
+      if (!prompt) return;
+      input.value = '';
+      unlockIOSAudio();
+      document.getElementById('reply').textContent = '⏳ Đang xử lý...';
+      await callAssistant(prompt);
+    }
+
     async function toggleMic() {
       const btn = document.getElementById('mic-btn');
       const replyBox = document.getElementById('reply');
 
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         clearTimeout(autoStopTimer);
+        unlockIOSAudio();
         mediaRecorder.stop();
         return;
       }
 
-      stopAudio();
+      unlockIOSAudio();
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         return alert('Trình duyệt không hỗ trợ ghi âm Micro.');
@@ -231,7 +201,7 @@
             const sttData = await sttRes.json();
             if (sttData.text) {
               replyBox.textContent = `🗣️ "${sttData.text}"\n⏳ Đang trả lời...`;
-              await sendPrompt(sttData.text);
+              await callAssistant(sttData.text);
             } else {
               replyBox.textContent = sttData.error || 'Không nghe rõ giọng nói, bạn thử lại nhé.';
             }
