@@ -1,5 +1,5 @@
 // netlify/functions/assistant.mjs - Netlify Functions v2 (Zero-Cost Backend)
-// Tối ưu tốc độ: Groq openai/gpt-oss-20b + Whisper STT + TTS an toàn (Gemini TTS 3.5s timeout -> fallback Google TTS)
+// Tối ưu: Groq openai/gpt-oss-20b + Whisper STT + Gemini TTS + Đọc chi tiết từng tin RSS theo số thứ tự/chủ đề
 
 export const config = {
   path: "/api/assistant"
@@ -25,17 +25,17 @@ export default async (req, context) => {
   const TELEGRAM_BOT_TOKEN = getEnv("TELEGRAM_BOT_TOKEN");
   const TELEGRAM_CHAT_ID = getEnv("TELEGRAM_CHAT_ID");
 
-  // Phát âm thanh tiếng Việt: GET /api/assistant?tts=...
+  // Phát âm thanh tiếng Việt nguyên đoạn (đồng nhất 1 giọng duy nhất): GET /api/assistant?tts=...
   if (req.method === "GET") {
     const reqUrl = new URL(req.url);
     const ttsText = reqUrl.searchParams.get("tts");
-    const engine = reqUrl.searchParams.get("engine") || "auto";
     if (!ttsText) {
       return Response.json({ status: "ok", fastModel: "openai/gpt-oss-20b" }, { status: 200, headers: corsHeaders });
     }
 
-    // 1. Thử giọng AI tự nhiên Gemini 3.8 Flash-Lite TTS (giới hạn 3.5s để không treo Netlify)
-    if (GEMINI_API_KEY && engine !== "google") {
+    const cleanText = ttsText.replace(/\s+/g, " ").trim().slice(0, 1000);
+
+    if (GEMINI_API_KEY) {
       try {
         const ttsRes = await fetchWithTimeout(
           "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite-tts:generateContent",
@@ -46,7 +46,7 @@ export default async (req, context) => {
               "x-goog-api-key": GEMINI_API_KEY.trim()
             },
             body: JSON.stringify({
-              contents: [{ parts: [{ text: ttsText.slice(0, 200) }] }],
+              contents: [{ parts: [{ text: cleanText }] }],
               generationConfig: {
                 responseModalities: ["AUDIO"],
                 speechConfig: {
@@ -57,13 +57,12 @@ export default async (req, context) => {
               }
             })
           },
-          3500
+          8500
         );
         const ttsJson = await ttsRes.json();
         const part = ttsJson?.candidates?.[0]?.content?.parts?.[0]?.inlineData;
         const b64 = part?.data;
         const mime = (part?.mimeType || "").toLowerCase();
-        // Chỉ trả về nếu đúng chuẩn WAV hoặc MP3 mà trình duyệt iOS Safari phát được
         if (b64 && (mime.includes("wav") || mime.includes("mpeg") || mime.includes("mp3"))) {
           const bin = Buffer.from(b64, "base64");
           if (bin.length > 1000) {
@@ -77,15 +76,12 @@ export default async (req, context) => {
             });
           }
         }
-      } catch (e) {
-        // Bỏ qua nếu quá 3.5s hoặc lỗi, chuyển ngay sang Google Translate TTS bên dưới
-      }
+      } catch (e) {}
     }
 
-    // 2. Dự phòng chắc chắn 100%: Google Translate TTS (MP3 chuẩn mọi trình duyệt)
     try {
-      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(ttsText.slice(0, 200))}`;
-      const audioRes = await fetchWithTimeout(ttsUrl, { headers: { "User-Agent": "Mozilla/5.0" } }, 3500);
+      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(cleanText.slice(0, 200))}`;
+      const audioRes = await fetchWithTimeout(ttsUrl, { headers: { "User-Agent": "Mozilla/5.0" } }, 4000);
       const buf = await audioRes.arrayBuffer();
       return new Response(buf, {
         status: 200,
@@ -136,7 +132,7 @@ export default async (req, context) => {
     }
   }
 
-  const askAI = (text) => callAI({ groqKey: GROQ_API_KEY, geminiKey: GEMINI_API_KEY, text });
+  const askAI = (text, maxTokens = 450) => callAI({ groqKey: GROQ_API_KEY, geminiKey: GEMINI_API_KEY, text, maxTokens });
 
   try {
     const body = await req.json().catch(() => ({}));
@@ -144,7 +140,8 @@ export default async (req, context) => {
       prompt,
       mode = "car",
       location = "Dau Tieng, Binh Duong",
-      drivingMinutes = 0
+      drivingMinutes = 0,
+      newsContext = []
     } = body;
 
     if (!prompt) {
@@ -159,16 +156,35 @@ export default async (req, context) => {
 
     const jsonReply = (payload, status = 200) => Response.json(payload, { status, headers: corsHeaders });
 
-    // 1. ĐIỂM TIN TỨC TRONG NGÀY (RSS VnExpress + dự phòng Tuổi Trẻ)
+    // 1A. ĐỌC CHI TIẾT BẢN TIN CỤ THỂ (khi người dùng hỏi: "chi tiết tin 2", "nói kỹ hơn tin đầu", "đọc rõ hơn về...")
+    const wantsDetail = (lower.includes("chi tiết") || lower.includes("kỹ hơn") || lower.includes("rõ hơn") || lower.includes("cụ thể") || lower.includes("đọc tin số") || lower.includes("tin thứ"))
+      && Array.isArray(newsContext) && newsContext.length > 0;
+
+    if (wantsDetail) {
+      let idx = detectNewsIndex(lower, newsContext);
+      const target = newsContext[idx] || newsContext[0];
+      const fullArticle = await fetchArticleBody(target.link);
+      const detailPrompt = `Bạn là phát thanh viên tin tức. Hãy trình bày chi tiết, đầy đủ thông tin cốt lõi bằng tiếng Việt (khoảng 5 đến 6 câu mạch lạc, không dùng dấu sao hay markdown) cho bản tin sau:
+Tiêu đề: ${target.title}
+Tóm tắt: ${target.desc}
+Nội dung bài báo: ${fullArticle || target.desc}`;
+
+      const reply = breakPrefix + await askAI(detailPrompt, 600);
+      logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "news_detail", mode).catch(() => {});
+      return jsonReply({ intent: "news_detail", reply, newsList: newsContext, audioAction: "speak" });
+    }
+
+    // 1B. ĐIỂM TIN TỨC TRONG NGÀY (RSS VnExpress + dự phòng Tuổi Trẻ)
     if (lower.includes("tin tức") || lower.includes("điểm tin") || lower.includes("báo mới")) {
-      const titles = await fetchLatestNewsTitles();
-      if (titles.length === 0) {
+      const items = await fetchLatestNewsItems();
+      if (items.length === 0) {
         return jsonReply({ intent: "news", reply: "Hiện không lấy được nguồn tin RSS từ báo điện tử, bạn thử lại sau ít phút nhé.", audioAction: "speak" });
       }
-      const summaryPrompt = `Bạn là trợ lý AI trên xe hơi. Hãy đọc tóm tắt tự nhiên, ngắn gọn bằng tiếng Việt 5 tin tức nổi bật sau đây trong khoảng 3 đến 4 câu để tài xế nghe nhanh (không dùng dấu sao hay ký hiệu markdown):\n${titles.join("\n")}`;
-      const reply = breakPrefix + await askAI(summaryPrompt);
+      const listStr = items.map((item, i) => `Tin ${i + 1}: ${item.title}. (${item.desc})`).join("\n");
+      const summaryPrompt = `Bạn là trợ lý AI trên xe hơi. Hãy điểm qua ngắn gọn 5 tin tức nổi bật sau đây đánh số từ Tin 1 đến Tin 5 bằng tiếng Việt tự nhiên (không dùng markdown). Cuối bản tin nhắc tài xế có thể nói "chi tiết tin số mấy" để nghe kỹ hơn:\n${listStr}`;
+      const reply = breakPrefix + await askAI(summaryPrompt, 500);
       logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "news", mode).catch(() => {});
-      return jsonReply({ intent: "news", reply, audioAction: "speak" });
+      return jsonReply({ intent: "news", reply, newsList: items, audioAction: "speak" });
     }
 
     // 2. PHÁT NHẠC KÉP (OFFLINE MICROSD / ĐÁM MÂY)
@@ -296,7 +312,7 @@ export default async (req, context) => {
 
     // 12. KỂ CHUYỆN / PODCAST AI ĐƯỜNG DÀI
     if (lower.includes("kể chuyện") || lower.includes("podcast")) {
-      const reply = await askAI(`Hãy kể một câu chuyện ngắn hoặc làm một đoạn mini-podcast 1 phút bằng tiếng Việt thật lôi cuốn, giọng văn tự nhiên để nghe khi lái xe đường dài về yêu cầu sau (không markdown):\n${prompt}`);
+      const reply = await askAI(`Hãy kể một câu chuyện ngắn tối đa 4 câu bằng tiếng Việt thật lôi cuốn, giọng văn tự nhiên để nghe khi lái xe về yêu cầu sau (không markdown):\n${prompt}`);
       return jsonReply({ intent: "podcast", reply: breakPrefix + reply, audioAction: "speak" });
     }
 
@@ -324,7 +340,21 @@ export default async (req, context) => {
   }
 };
 
-async function fetchLatestNewsTitles() {
+function detectNewsIndex(lower, newsContext) {
+  if (lower.includes("1") || lower.includes("một") || lower.includes("đầu")) return 0;
+  if (lower.includes("2") || lower.includes("hai")) return 1;
+  if (lower.includes("3") || lower.includes("ba")) return 2;
+  if (lower.includes("4") || lower.includes("bốn") || lower.includes("tư")) return 3;
+  if (lower.includes("5") || lower.includes("năm") || lower.includes("cuối")) return Math.min(4, newsContext.length - 1);
+  // Khớp theo từ khóa trong tiêu đề nếu người dùng không đọc số
+  for (let i = 0; i < newsContext.length; i++) {
+    const words = (newsContext[i].title || "").toLowerCase().split(/\s+/).filter(w => w.length >= 4);
+    if (words.some(w => lower.includes(w))) return i;
+  }
+  return 0;
+}
+
+async function fetchLatestNewsItems() {
   const feeds = [
     "https://vnexpress.net/rss/tin-moi-nhat.rss",
     "https://tuoitre.vn/rss/tin-moi-nhat.rss"
@@ -336,12 +366,40 @@ async function fetchLatestNewsTitles() {
       }, 3500);
       if (!res.ok) continue;
       const xml = await res.text();
-      const matches = [...xml.matchAll(/<item>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/gi)];
-      const titles = matches.slice(0, 5).map((m, i) => `${i + 1}. ${m[1].trim()}`);
-      if (titles.length > 0) return titles;
+      const itemBlocks = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)].slice(0, 5);
+      const items = itemBlocks.map(b => {
+        const block = b[1];
+        const title = (block.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i)?.[1] || "").trim();
+        const link = (block.match(/<link>([\s\S]*?)<\/link>/i)?.[1] || "").trim();
+        const rawDesc = (block.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i)?.[1] || "").trim();
+        const desc = rawDesc.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        return { title, link, desc };
+      }).filter(x => x.title);
+      if (items.length > 0) return items;
     } catch (e) {}
   }
   return [];
+}
+
+async function fetchArticleBody(url) {
+  if (!url) return "";
+  try {
+    const res = await fetchWithTimeout(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+    }, 3500);
+    if (!res.ok) return "";
+    const html = await res.text();
+    const paragraphs = [...html.matchAll(/<p[^>]*class="[^"]*Normal[^"]*"[^>]*>([\s\S]*?)<\/p>/gi)]
+      .map(m => m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim())
+      .filter(t => t.length > 30);
+    if (paragraphs.length > 0) return paragraphs.slice(0, 6).join(" ").slice(0, 1800);
+    const genericP = [...html.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)]
+      .map(m => m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim())
+      .filter(t => t.length > 50);
+    return genericP.slice(0, 5).join(" ").slice(0, 1500);
+  } catch (e) {
+    return "";
+  }
 }
 
 function buildSbHeaders(key, extra = {}) {
@@ -384,7 +442,7 @@ async function fetchWithTimeout(url, options, ms = 6000) {
   }
 }
 
-async function callAI({ groqKey, geminiKey, text }) {
+async function callAI({ groqKey, geminiKey, text, maxTokens = 450 }) {
   if (groqKey) {
     const groqModels = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
     for (const model of groqModels) {
@@ -399,7 +457,7 @@ async function callAI({ groqKey, geminiKey, text }) {
             model,
             messages: [{ role: "user", content: text }],
             temperature: 0.6,
-            max_tokens: 350
+            max_tokens: maxTokens
           })
         }, 5500);
         const data = await resp.json();
