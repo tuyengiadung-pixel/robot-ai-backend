@@ -71,7 +71,8 @@
   <script>
     let currentMode = 'car';
     let drivingMinutes = 0;
-    let audioQueue = [];
+    let audioUrls = [];
+    let currentIdx = 0;
     let mediaRecorder = null;
     let mediaStream = null;
     let audioChunks = [];
@@ -95,13 +96,17 @@
     }
 
     function stopAudio() {
-      audioQueue = [];
+      audioUrls.forEach(u => { if (u.startsWith('blob:')) URL.revokeObjectURL(u); });
+      audioUrls = [];
+      currentIdx = 0;
       player.pause();
       player.src = '';
     }
 
-    function splitChunks(text, maxLen = 170) {
-      const sentences = text.replace(/\n+/g, '. ').split(/(?<=[.!?])\s+/);
+    function splitChunks(text, maxLen = 500) {
+      const clean = text.replace(/\n+/g, '. ').trim();
+      if (clean.length <= maxLen) return [clean];
+      const sentences = clean.split(/(?<=[.!?])\s+/);
       const chunks = [];
       let current = '';
       for (const s of sentences) {
@@ -109,40 +114,34 @@
           current = (current + ' ' + s).trim();
         } else {
           if (current) chunks.push(current);
-          if (s.length <= maxLen) {
-            current = s;
-          } else {
-            const words = s.split(' ');
-            current = '';
-            for (const w of words) {
-              if ((current + ' ' + w).trim().length <= maxLen) {
-                current = (current + ' ' + w).trim();
-              } else {
-                if (current) chunks.push(current);
-                current = w;
-              }
-            }
-          }
+          current = s;
         }
       }
       if (current) chunks.push(current);
       return chunks;
     }
 
-    function playNextChunk() {
-      if (audioQueue.length === 0) return;
-      const chunk = audioQueue.shift();
-      player.src = `/api/assistant?tts=${encodeURIComponent(chunk)}`;
-      player.play().catch(() => {});
-    }
-
-    player.addEventListener('ended', playNextChunk);
-
-    function speakVietnamese(text) {
+    async function speakVietnamese(text) {
       stopAudio();
-      audioQueue = splitChunks(text);
-      playNextChunk();
+      const chunks = splitChunks(text, 500);
+      if (chunks.length === 0) return;
+
+      // Phát ngay đoạn đầu và tải song song đoạn sau để không bị khựng
+      const url0 = `/api/assistant?tts=${encodeURIComponent(chunks[0])}`;
+      player.src = url0;
+      player.play().catch(() => {});
+
+      if (chunks.length > 1) {
+        audioUrls = chunks.slice(1).map(c => `/api/assistant?tts=${encodeURIComponent(c)}`);
+      }
     }
+
+    player.addEventListener('ended', () => {
+      if (currentIdx < audioUrls.length) {
+        player.src = audioUrls[currentIdx++];
+        player.play().catch(() => {});
+      }
+    });
 
     async function sendPrompt(customText) {
       const input = document.getElementById('prompt-input');
@@ -174,7 +173,6 @@
       const btn = document.getElementById('mic-btn');
       const replyBox = document.getElementById('reply');
 
-      // Nếu đang ghi âm -> dừng lại và gửi lên Groq Whisper
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         clearTimeout(autoStopTimer);
         mediaRecorder.stop();
@@ -182,7 +180,6 @@
       }
 
       stopAudio();
-      // Mở khóa audio iOS ngay khi bấm nút
       player.play().catch(() => {});
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -214,7 +211,7 @@
             return;
           }
 
-          replyBox.textContent = '🎧 Đang nghe và dịch giọng nói...';
+          replyBox.textContent = '🎧 Đang nghe...';
           const form = new FormData();
           form.append('file', blob, `voice.${ext}`);
 
@@ -222,7 +219,7 @@
             const sttRes = await fetch('/api/assistant?stt=1', { method: 'POST', body: form });
             const sttData = await sttRes.json();
             if (sttData.text) {
-              replyBox.textContent = `🗣️ Bạn nói: "${sttData.text}"\n⏳ Đang trả lời...`;
+              replyBox.textContent = `🗣️ "${sttData.text}"\n⏳ Đang trả lời...`;
               await sendPrompt(sttData.text);
             } else {
               replyBox.textContent = sttData.error || 'Không nghe rõ giọng nói, bạn thử lại nhé.';
