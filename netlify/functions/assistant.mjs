@@ -1,5 +1,5 @@
 // netlify/functions/assistant.mjs - Netlify Functions v2 (Zero-Cost Backend)
-// Tối ưu tốc độ: Groq openai/gpt-oss-20b (1000 tok/s) + Whisper STT + Gemini 3.8 Flash-Lite TTS giọng tự nhiên
+// Tối ưu tốc độ: Groq openai/gpt-oss-20b + Whisper STT + TTS an toàn (Gemini TTS 3.5s timeout -> fallback Google TTS)
 
 export const config = {
   path: "/api/assistant"
@@ -25,16 +25,17 @@ export default async (req, context) => {
   const TELEGRAM_BOT_TOKEN = getEnv("TELEGRAM_BOT_TOKEN");
   const TELEGRAM_CHAT_ID = getEnv("TELEGRAM_CHAT_ID");
 
-  // Phát âm thanh giọng tự nhiên tiếng Việt: GET /api/assistant?tts=...
+  // Phát âm thanh tiếng Việt: GET /api/assistant?tts=...
   if (req.method === "GET") {
     const reqUrl = new URL(req.url);
     const ttsText = reqUrl.searchParams.get("tts");
+    const engine = reqUrl.searchParams.get("engine") || "auto";
     if (!ttsText) {
-      return Response.json({ status: "ok", fastModel: "openai/gpt-oss-20b", tts: "gemini-3.8-flash-lite-tts" }, { status: 200, headers: corsHeaders });
+      return Response.json({ status: "ok", fastModel: "openai/gpt-oss-20b" }, { status: 200, headers: corsHeaders });
     }
 
-    // 1. Ưu tiên giọng AI tự nhiên Gemini 3.8 Flash-Lite TTS (WAV chuẩn RIFF)
-    if (GEMINI_API_KEY) {
+    // 1. Thử giọng AI tự nhiên Gemini 3.8 Flash-Lite TTS (giới hạn 3.5s để không treo Netlify)
+    if (GEMINI_API_KEY && engine !== "google") {
       try {
         const ttsRes = await fetchWithTimeout(
           "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite-tts:generateContent",
@@ -45,7 +46,7 @@ export default async (req, context) => {
               "x-goog-api-key": GEMINI_API_KEY.trim()
             },
             body: JSON.stringify({
-              contents: [{ parts: [{ text: ttsText.slice(0, 600) }] }],
+              contents: [{ parts: [{ text: ttsText.slice(0, 200) }] }],
               generationConfig: {
                 responseModalities: ["AUDIO"],
                 speechConfig: {
@@ -56,31 +57,35 @@ export default async (req, context) => {
               }
             })
           },
-          7000
+          3500
         );
         const ttsJson = await ttsRes.json();
-        const b64 = ttsJson?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        const mime = ttsJson?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType || "audio/wav";
-        if (b64) {
+        const part = ttsJson?.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+        const b64 = part?.data;
+        const mime = (part?.mimeType || "").toLowerCase();
+        // Chỉ trả về nếu đúng chuẩn WAV hoặc MP3 mà trình duyệt iOS Safari phát được
+        if (b64 && (mime.includes("wav") || mime.includes("mpeg") || mime.includes("mp3"))) {
           const bin = Buffer.from(b64, "base64");
-          return new Response(bin, {
-            status: 200,
-            headers: {
-              ...corsHeaders,
-              "Content-Type": mime,
-              "Cache-Control": "public, max-age=3600"
-            }
-          });
+          if (bin.length > 1000) {
+            return new Response(bin, {
+              status: 200,
+              headers: {
+                ...corsHeaders,
+                "Content-Type": mime,
+                "Cache-Control": "public, max-age=3600"
+              }
+            });
+          }
         }
       } catch (e) {
-        // Fallback sang Google Translate TTS nếu Gemini TTS quá tải
+        // Bỏ qua nếu quá 3.5s hoặc lỗi, chuyển ngay sang Google Translate TTS bên dưới
       }
     }
 
-    // 2. Dự phòng Google Translate TTS (MP3)
+    // 2. Dự phòng chắc chắn 100%: Google Translate TTS (MP3 chuẩn mọi trình duyệt)
     try {
       const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(ttsText.slice(0, 200))}`;
-      const audioRes = await fetch(ttsUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const audioRes = await fetchWithTimeout(ttsUrl, { headers: { "User-Agent": "Mozilla/5.0" } }, 3500);
       const buf = await audioRes.arrayBuffer();
       return new Response(buf, {
         status: 200,
@@ -380,7 +385,6 @@ async function fetchWithTimeout(url, options, ms = 6000) {
 }
 
 async function callAI({ groqKey, geminiKey, text }) {
-  // Ưu tiên openai/gpt-oss-20b (1000 tokens/s, siêu nhanh) trước, sau đó mới tới 120b
   if (groqKey) {
     const groqModels = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
     for (const model of groqModels) {
