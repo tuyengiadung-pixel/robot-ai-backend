@@ -1,5 +1,5 @@
 // netlify/functions/assistant.mjs - Netlify Functions v2 (Zero-Cost Backend)
-// Hỗ trợ: 4 tính năng cốt lõi (Phần A) + 12 tính năng mở rộng (Phần B) + TTS MP3 + STT Groq Whisper tiếng Việt
+// Tối ưu tốc độ: Groq openai/gpt-oss-20b (1000 tok/s) + Whisper STT + Gemini 3.8 Flash-Lite TTS giọng tự nhiên
 
 export const config = {
   path: "/api/assistant"
@@ -16,18 +16,71 @@ export default async (req, context) => {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
 
-  // Phát âm thanh MP3 tiếng Việt chuẩn Media cho điện thoại & PC: GET /api/assistant?tts=...
+  const getEnv = (name) => (typeof Netlify !== "undefined" && Netlify.env ? Netlify.env.get(name) : undefined) || process.env[name];
+
+  const GROQ_API_KEY = getEnv("GROQ_API_KEY");
+  const GEMINI_API_KEY = getEnv("GEMINI_API_KEY");
+  const SUPABASE_URL = getEnv("SUPABASE_URL");
+  const SUPABASE_KEY = getEnv("SUPABASE_ANON_KEY");
+  const TELEGRAM_BOT_TOKEN = getEnv("TELEGRAM_BOT_TOKEN");
+  const TELEGRAM_CHAT_ID = getEnv("TELEGRAM_CHAT_ID");
+
+  // Phát âm thanh giọng tự nhiên tiếng Việt: GET /api/assistant?tts=...
   if (req.method === "GET") {
     const reqUrl = new URL(req.url);
     const ttsText = reqUrl.searchParams.get("tts");
     if (!ttsText) {
-      return Response.json({ status: "ok", providers: ["groq", "gemini", "whisper"] }, { status: 200, headers: corsHeaders });
+      return Response.json({ status: "ok", fastModel: "openai/gpt-oss-20b", tts: "gemini-3.8-flash-lite-tts" }, { status: 200, headers: corsHeaders });
     }
+
+    // 1. Ưu tiên giọng AI tự nhiên Gemini 3.8 Flash-Lite TTS (WAV chuẩn RIFF)
+    if (GEMINI_API_KEY) {
+      try {
+        const ttsRes = await fetchWithTimeout(
+          "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash-lite-tts:generateContent",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": GEMINI_API_KEY.trim()
+            },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: ttsText.slice(0, 600) }] }],
+              generationConfig: {
+                responseModalities: ["AUDIO"],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: "Aoede" }
+                  }
+                }
+              }
+            })
+          },
+          7000
+        );
+        const ttsJson = await ttsRes.json();
+        const b64 = ttsJson?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        const mime = ttsJson?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType || "audio/wav";
+        if (b64) {
+          const bin = Buffer.from(b64, "base64");
+          return new Response(bin, {
+            status: 200,
+            headers: {
+              ...corsHeaders,
+              "Content-Type": mime,
+              "Cache-Control": "public, max-age=3600"
+            }
+          });
+        }
+      } catch (e) {
+        // Fallback sang Google Translate TTS nếu Gemini TTS quá tải
+      }
+    }
+
+    // 2. Dự phòng Google Translate TTS (MP3)
     try {
       const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=${encodeURIComponent(ttsText.slice(0, 200))}`;
-      const audioRes = await fetch(ttsUrl, {
-        headers: { "User-Agent": "Mozilla/5.0" }
-      });
+      const audioRes = await fetch(ttsUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
       const buf = await audioRes.arrayBuffer();
       return new Response(buf, {
         status: 200,
@@ -45,15 +98,6 @@ export default async (req, context) => {
   if (req.method !== "POST") {
     return Response.json({ error: "Method Not Allowed" }, { status: 405, headers: corsHeaders });
   }
-
-  const getEnv = (name) => (typeof Netlify !== "undefined" && Netlify.env ? Netlify.env.get(name) : undefined) || process.env[name];
-
-  const GROQ_API_KEY = getEnv("GROQ_API_KEY");
-  const GEMINI_API_KEY = getEnv("GEMINI_API_KEY");
-  const SUPABASE_URL = getEnv("SUPABASE_URL");
-  const SUPABASE_KEY = getEnv("SUPABASE_ANON_KEY");
-  const TELEGRAM_BOT_TOKEN = getEnv("TELEGRAM_BOT_TOKEN");
-  const TELEGRAM_CHAT_ID = getEnv("TELEGRAM_CHAT_ID");
 
   // Chuyển giọng nói thành văn bản (STT) qua Groq Whisper: POST /api/assistant?stt=1
   const reqUrl = new URL(req.url);
@@ -76,7 +120,7 @@ export default async (req, context) => {
         method: "POST",
         headers: { "Authorization": `Bearer ${GROQ_API_KEY.trim()}` },
         body: groqForm
-      }, 8000);
+      }, 7500);
       const sttData = await sttRes.json();
       if (sttData.error) {
         return Response.json({ error: sttData.error.message }, { status: 500, headers: corsHeaders });
@@ -116,9 +160,9 @@ export default async (req, context) => {
       if (titles.length === 0) {
         return jsonReply({ intent: "news", reply: "Hiện không lấy được nguồn tin RSS từ báo điện tử, bạn thử lại sau ít phút nhé.", audioAction: "speak" });
       }
-      const summaryPrompt = `Bạn là trợ lý AI trên xe hơi. Hãy đọc tóm tắt tự nhiên, mạch lạc bằng tiếng Việt 5 tin tức nổi bật sau đây thành bản tin ngắn 30 giây cho tài xế nghe (không dùng dấu sao hay ký hiệu markdown):\n${titles.join("\n")}`;
+      const summaryPrompt = `Bạn là trợ lý AI trên xe hơi. Hãy đọc tóm tắt tự nhiên, ngắn gọn bằng tiếng Việt 5 tin tức nổi bật sau đây trong khoảng 3 đến 4 câu để tài xế nghe nhanh (không dùng dấu sao hay ký hiệu markdown):\n${titles.join("\n")}`;
       const reply = breakPrefix + await askAI(summaryPrompt);
-      await logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "news", mode);
+      logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "news", mode).catch(() => {});
       return jsonReply({ intent: "news", reply, audioAction: "speak" });
     }
 
@@ -164,7 +208,7 @@ export default async (req, context) => {
         body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: `🚗 [Robot AI]: ${msgText}` })
       });
       const reply = `Đã gửi tin nhắn Telegram: ${msgText}`;
-      await logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "telegram_send", mode);
+      logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "telegram_send", mode).catch(() => {});
       return jsonReply({ intent: "telegram_send", reply, audioAction: "speak", ledColor: "green" });
     }
 
@@ -195,7 +239,7 @@ export default async (req, context) => {
     // 6. CẢNH BÁO THỜI TIẾT THEO TUYẾN ĐƯỜNG
     if (lower.includes("thời tiết") || lower.includes("trời mưa") || lower.includes("tuyến đường")) {
       const targetCity = lower.includes("sài gòn") || lower.includes("hồ chí minh") ? "Ho Chi Minh City" : location;
-      const wRes = await fetch(`https://wttr.in/${encodeURIComponent(targetCity)}?format=j1`);
+      const wRes = await fetchWithTimeout(`https://wttr.in/${encodeURIComponent(targetCity)}?format=j1`, {}, 4000);
       const wJson = await wRes.json();
       const cur = wJson?.current_condition?.[0];
       const weatherInfo = cur ? `Nhiệt độ ${cur.temp_C}°C, độ ẩm ${cur.humidity}%, gió ${cur.windspeedKmph} km/h, tình trạng: ${cur.weatherDesc?.[0]?.value}` : "Không lấy được dữ liệu chi tiết";
@@ -211,7 +255,7 @@ export default async (req, context) => {
 
     // 8. HỎI ĐÁP LUẬT GIAO THÔNG & XỬ LÝ LỖI XE TỨC THÌ
     if (lower.includes("luật") || lower.includes("phạt") || lower.includes("biển báo") || lower.includes("đèn báo") || lower.includes("check engine") || lower.includes("lỗi xe")) {
-      const reply = await askAI(`Bạn là chuyên gia kỹ thuật ô tô và Luật giao thông đường bộ Việt Nam. Hãy trả lời câu hỏi sau bằng tiếng Việt thật ngắn gọn, chuẩn xác để tài xế nghe trong 15 giây (không markdown):\n${prompt}`);
+      const reply = await askAI(`Bạn là chuyên gia kỹ thuật ô tô và Luật giao thông đường bộ Việt Nam. Hãy trả lời câu hỏi sau bằng tiếng Việt thật ngắn gọn trong 2 đến 3 câu để tài xế nghe nhanh (không markdown):\n${prompt}`);
       return jsonReply({ intent: "traffic_auto", reply: breakPrefix + reply, audioAction: "speak" });
     }
 
@@ -247,7 +291,7 @@ export default async (req, context) => {
 
     // 12. KỂ CHUYỆN / PODCAST AI ĐƯỜNG DÀI
     if (lower.includes("kể chuyện") || lower.includes("podcast")) {
-      const reply = await askAI(`Hãy kể một câu chuyện hoặc làm một đoạn mini-podcast 2 phút bằng tiếng Việt thật lôi cuốn, giọng văn tự nhiên để nghe khi lái xe đường dài về yêu cầu sau (không markdown):\n${prompt}`);
+      const reply = await askAI(`Hãy kể một câu chuyện ngắn hoặc làm một đoạn mini-podcast 1 phút bằng tiếng Việt thật lôi cuốn, giọng văn tự nhiên để nghe khi lái xe đường dài về yêu cầu sau (không markdown):\n${prompt}`);
       return jsonReply({ intent: "podcast", reply: breakPrefix + reply, audioAction: "speak" });
     }
 
@@ -263,11 +307,11 @@ export default async (req, context) => {
 
     // 14. TRÒ CHUYỆN AI THÔNG THƯỜNG
     const systemContext = mode === "car"
-      ? "Bạn là trợ lý AI đồng hành trên xe hơi. Trả lời bằng tiếng Việt ngắn gọn, súc tích, thân thiện, không dùng dấu sao hay ký hiệu markdown."
-      : "Bạn là trợ lý AI trên bàn làm việc. Trả lời bằng tiếng Việt thông minh, rõ ràng, không dùng markdown.";
+      ? "Bạn là trợ lý AI đồng hành trên xe hơi. Trả lời bằng tiếng Việt ngắn gọn tối đa 3 câu, tự nhiên như người nói chuyện, không dùng dấu sao hay ký hiệu markdown."
+      : "Bạn là trợ lý AI trên bàn làm việc. Trả lời bằng tiếng Việt súc tích, rõ ràng, không dùng markdown.";
 
     const reply = breakPrefix + await askAI(`${systemContext}\nNgười dùng: ${prompt}`);
-    await logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "chat", mode);
+    logChat(SUPABASE_URL, SUPABASE_KEY, prompt, reply, "chat", mode).catch(() => {});
     return jsonReply({ intent: "chat", reply, audioAction: "speak" });
 
   } catch (err) {
@@ -284,15 +328,13 @@ async function fetchLatestNewsTitles() {
     try {
       const res = await fetchWithTimeout(feedUrl, {
         headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-      }, 4500);
+      }, 3500);
       if (!res.ok) continue;
       const xml = await res.text();
       const matches = [...xml.matchAll(/<item>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/gi)];
       const titles = matches.slice(0, 5).map((m, i) => `${i + 1}. ${m[1].trim()}`);
       if (titles.length > 0) return titles;
-    } catch (e) {
-      // Thử nguồn báo tiếp theo
-    }
+    } catch (e) {}
   }
   return [];
 }
@@ -327,7 +369,7 @@ async function logChat(url, key, user_query, ai_reply, intent, device_mode) {
   await sbInsert(url, key, "assistant_logs", { user_query, ai_reply, intent, device_mode });
 }
 
-async function fetchWithTimeout(url, options, ms = 6500) {
+async function fetchWithTimeout(url, options, ms = 6000) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -338,8 +380,9 @@ async function fetchWithTimeout(url, options, ms = 6500) {
 }
 
 async function callAI({ groqKey, geminiKey, text }) {
+  // Ưu tiên openai/gpt-oss-20b (1000 tokens/s, siêu nhanh) trước, sau đó mới tới 120b
   if (groqKey) {
-    const groqModels = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+    const groqModels = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];
     for (const model of groqModels) {
       try {
         const resp = await fetchWithTimeout("https://api.groq.com/openai/v1/chat/completions", {
@@ -351,9 +394,10 @@ async function callAI({ groqKey, geminiKey, text }) {
           body: JSON.stringify({
             model,
             messages: [{ role: "user", content: text }],
-            temperature: 0.7
+            temperature: 0.6,
+            max_tokens: 350
           })
-        }, 6500);
+        }, 5500);
         const data = await resp.json();
         const reply = data?.choices?.[0]?.message?.content;
         if (reply) return reply.trim();
@@ -374,13 +418,13 @@ async function callAI({ groqKey, geminiKey, text }) {
           "x-goog-api-key": geminiKey.trim()
         },
         body: JSON.stringify({ contents: [{ parts: [{ text }] }] })
-      }, 6500);
+      }, 6000);
       const data = await resp.json();
       if (data.error) return `Lỗi Gemini (${data.error.code}): ${data.error.message}`;
       const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (reply) return reply;
     } catch (e) {
-      return "Máy chủ AI đang phản hồi chậm quá 6 giây, bạn bấm thử lại nhé.";
+      return "Máy chủ AI đang phản hồi chậm, bạn bấm thử lại nhé.";
     }
   }
 
